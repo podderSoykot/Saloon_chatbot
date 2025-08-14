@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from dateutil.parser import parse as parse_date
 from .models import Staff, Customer, Booking, Haircut, BeardCut, Facial, Spa, StaffAvailability
 
 # -----------------------------
@@ -169,51 +170,175 @@ class BookServiceAPIView(APIView):
 # -----------------------------
 conversation_state = {}
 
+# Intent keywords
+INTENTS = {
+    "greeting": ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "yo", "hiya"],
+    "thanks": ["thanks", "thank you", "thx", "ty", "thank u", "thanks a lot"],
+    "service_request": ["haircut", "hair cut", "beard", "facial", "spa", "massage", "shave"],
+    "date_keywords": ["today", "tomorrow", "next day", "day after tomorrow",
+                      "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+    "slot_selection": [],  # populated dynamically (HH:MM or staff + HH:MM)
+    "unknown": []
+}
+
+# -----------------------------
+# Intent Detection Function
+# -----------------------------
+def detect_intent(message):
+    message = message.lower()
+
+    # Check greetings
+    if any(g in message for g in INTENTS["greeting"]):
+        return "greeting"
+
+    # Check thanks
+    if any(t in message for t in INTENTS["thanks"]):
+        return "thanks"
+
+    # Check service request
+    if any(s in message for s in INTENTS["service_request"]):
+        return "service_request"
+
+    # Check for date keywords or explicit dates
+    if any(d in message for d in INTENTS["date_keywords"]):
+        return "date_keywords"
+    try:
+        parse_date(message, fuzzy=True)
+        return "date_keywords"
+    except:
+        pass
+
+    # Check for slot selection: HH:MM or staff + HH:MM
+    if re.search(r'\b\d{1,2}:\d{2}\b', message):
+        return "slot_selection"
+
+    # Fallback unknown
+    return "unknown"
+
 class ChatbotAPIView(APIView):
-    """Handle conversational chatbot for salon"""
+    """Intent-based conversational chatbot for salon with real slot checking"""
+
     def post(self, request):
         user_id = request.data.get("user_id")
-        message = request.data.get("message", "").lower().strip()
+        message = request.data.get("message", "").strip()
+
+        if not user_id or not message:
+            return Response({"bot": "Please provide user_id and message."})
 
         if user_id not in conversation_state:
-            conversation_state[user_id] = {"stage": "greeting", "service_type": None, "selected_slot": None}
+            conversation_state[user_id] = {
+                "stage": "greeting",
+                "service_type": None,
+                "selected_slot": None,
+                "requested_date": None,
+                "available_slots": {}
+            }
 
         state = conversation_state[user_id]
         stage = state["stage"]
+        intent = detect_intent(message)
 
+        # -----------------------------
         # Stage 1: Greeting
+        # -----------------------------
         if stage == "greeting":
-            if any(g in message for g in ["hi","hello","hey"]):
+            if intent in ["greeting", "service_request"]:
                 state["stage"] = "choose_service"
-                return Response({"bot": "Welcome to our salon! We provide Haircut, Beard, Facial, and SPA services. What would you like today?"})
-            return Response({"bot": "Hi! Say 'hi' to start."})
+                return Response({
+                    "bot": "Welcome to our salon! We provide Haircut, Beard, Facial, and SPA services. Which service would you like today?"
+                })
+            return Response({"bot": "Hi! Say 'hi' or type the service you want."})
 
+        # -----------------------------
         # Stage 2: Choose Service
+        # -----------------------------
         if stage == "choose_service":
+            if intent != "service_request":
+                return Response({"bot": "I didn't catch that. Which service would you like: Haircut, Beard, Facial, or SPA?"})
+
+            # Detect service type
             for service_type in SERVICE_MODELS.keys():
-                if service_type in message:
+                if service_type in message.lower():
                     state["service_type"] = service_type
-                    service_model = get_service_model(service_type)
-                    today = datetime.today().date()
-                    slots = get_available_slots(service_model.objects.first(), today)
-                    if slots:
-                        state["stage"] = "pick_slot"
-                        slot_message = "\n".join([f"{staff}: {', '.join(times)}" for staff, times in slots.items()])
-                        return Response({"bot": f"Great! Available slots for {service_type} today:\n{slot_message}\nReply with your preferred time and staff."})
+                    break
+
+            if not state["service_type"]:
+                return Response({"bot": "Please choose a valid service: Haircut, Beard, Facial, or SPA."})
+
+            # Detect requested date
+            requested_date = datetime.today().date()
+            if "tomorrow" in message or "next day" in message:
+                requested_date += timedelta(days=1)
+            else:
+                try:
+                    requested_date = parse_date(message, fuzzy=True).date()
+                except:
+                    pass
+            state["requested_date"] = requested_date
+
+            # Fetch all service instances with staff
+            service_model = get_service_model(state["service_type"])
+            services_with_staff = service_model.objects.filter(staff__isnull=False)
+
+            all_slots = {}
+            for service_instance in services_with_staff:
+                slots = get_available_slots(service_instance, requested_date)
+                for staff, times in slots.items():
+                    if staff not in all_slots:
+                        all_slots[staff] = times
                     else:
-                        return Response({"bot": f"Sorry, no available slots for {service_type} today."})
-            return Response({"bot": "I didn't understand. Which service would you like? Haircut, Beard, Facial, or SPA?"})
+                        all_slots[staff].extend(times)
 
+            # Remove duplicates and sort times
+            for staff in all_slots:
+                all_slots[staff] = sorted(list(set(all_slots[staff])))
+
+            if not all_slots:
+                return Response({"bot": f"Sorry, no available slots for {state['service_type']} on {requested_date}."})
+
+            state["available_slots"] = all_slots
+            state["stage"] = "pick_slot"
+
+            # Prepare message with numbered slots
+            slot_message = ""
+            counter = 1
+            slot_map = {}
+            for staff, times in all_slots.items():
+                for t in times:
+                    slot_map[str(counter)] = f"{staff} {t}"
+                    slot_message += f"{counter}. {staff}: {t}\n"
+                    counter += 1
+            state["slot_map"] = slot_map
+
+            return Response({
+                "bot": f"Available slots for {state['service_type']} on {requested_date}:\n{slot_message}\nReply with the number of your preferred slot."
+            })
+
+        # -----------------------------
         # Stage 3: Pick Slot
+        # -----------------------------
         if stage == "pick_slot":
-            state["selected_slot"] = message
-            state["stage"] = "booking_link"
-            booking_url = f"/api/book/?service_type={state['service_type']}&slot={message}"
-            return Response({"bot": f"Perfect! To confirm your {state['service_type']} at {message}, please complete your booking here: {booking_url}\nThanks! We also offer Beard, Facial, and SPA services if you want more."})
+            slot_map = state.get("slot_map", {})
+            if message not in slot_map:
+                return Response({"bot": "Please reply with a valid slot number from the list."})
 
-        # Stage 4: After user thanks
-        if "thanks" in message or "thank you" in message:
+            selected = slot_map[message]  # e.g., "John Doe 10:00"
+            state["selected_slot"] = selected
+            state["stage"] = "booking_link"
+
+            staff_name, slot_time = " ".join(selected.split()[:-1]), selected.split()[-1]
+            booking_url = f"/api/book/?service_type={state['service_type']}&staff_name={staff_name}&time={slot_time}&date={state['requested_date']}"
+
+            return Response({
+                "bot": f"Perfect! Confirm your {state['service_type']} at {selected} here: {booking_url}\nThanks! We also offer Beard, Facial, and SPA services."
+            })
+
+        # -----------------------------
+        # Stage 4: Thanks
+        # -----------------------------
+        if intent == "thanks":
             state["stage"] = "end"
             return Response({"bot": "You're welcome! We also provide Haircut, Beard, Facial, and SPA services. Feel free to ask."})
 
+        # Default fallback
         return Response({"bot": "Sorry, I didn't understand. Can you please rephrase?"})
