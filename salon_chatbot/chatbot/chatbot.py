@@ -389,7 +389,7 @@ class ChatbotAPIView(APIView):
         )
 
         return Response({
-            "bot": f"Perfect! Your {state['service_type']} appointment is reserved with {staff_name} at {slot_time} on {state['requested_date'].strftime('%B %d, %Y')}.\n\nClick here to complete your booking: {booking_url} \n\nThank you for choosing FIDDEN!"
+            "bot": f"Perfect! Your {state['service_type']} appointment is reserved with {staff_name} at {slot_time} on {state['requested_date'].strftime('%B %d, %Y')}.\n\nClick here to complete your booking: {booking_url} \nThank you for choosing FIDDEN!"
         })
 
 
