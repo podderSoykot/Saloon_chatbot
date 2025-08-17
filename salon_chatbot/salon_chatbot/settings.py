@@ -126,7 +126,4 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Additional locations of static files
-STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, 'static'),  # project-level static folder
-    os.path.join(BASE_DIR, 'chatbot', 'static'),  # app-level static folder
-]
+STATICFILES_DIRS = [BASE_DIR / "static"]

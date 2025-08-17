@@ -249,9 +249,11 @@ class ChatbotAPIView(APIView):
             return self._handle_conversation_stage(state, intent, message)
 
         except Exception as e:
+            print(e)
             return Response(
                 {"bot": "I'm experiencing some technical difficulties. Please try again.", "error": True},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                
             )
 
     def _handle_conversation_stage(self, state, intent, message):
