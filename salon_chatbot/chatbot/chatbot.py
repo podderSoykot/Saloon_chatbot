@@ -47,6 +47,10 @@ INTENTS = {
         "keywords": ["help", "what can you do", "options", "commands"],
         "response": "I can help you:\n• Book appointments for Haircut, Beard, Facial, or SPA\n• Check pricing and working hours\n• Find available time slots\n\nJust tell me what service you'd like to book!"
     },
+    "available_dates": {
+        "keywords": ["available dates", "preferable dates", "what dates", "which dates", "show dates", "dates available"],
+        "response": "We're open Monday through Saturday. You can book for today, tomorrow, or any future date that works for you. Which specific date would you prefer?"
+    },
     "slot_selection": {"keywords": [], "response": "Please confirm your slot."},
     "unknown": {"keywords": [], "response": "I'm not sure I understand. You can say 'help' to see what I can do, or simply tell me which service you'd like to book."}
 }
@@ -56,14 +60,27 @@ def detect_intent(message):
     """Improved intent detection with better pattern matching"""
     message_lower = message.lower().strip()
     
-    # Check for specific intents first
+    # Check for specific intents first - order matters!
+    
+    # Check for available dates request first
+    if any(phrase in message_lower for phrase in ["available dates", "preferable dates", "what dates", "which dates", "show dates", "dates available"]):
+        return "available_dates"
+    
+    # Check for service requests with dates combined
+    service_type = validate_service_type(message_lower)
+    has_date = is_date_message(message_lower)
+    
+    if service_type and has_date:
+        return "service_with_date"
+    
+    # Check other intents
     for intent, info in INTENTS.items():
         keywords = info.get("keywords", [])
         if any(keyword in message_lower for keyword in keywords):
             return intent
     
     # Check for date patterns
-    if is_date_message(message_lower):
+    if has_date:
         return "date_keywords"
     
     # Check for time slot patterns (HH:MM or just numbers)
@@ -220,7 +237,6 @@ class ChatbotAPIView(APIView):
 
             state = conversation_state[user_id]
             state["last_activity"] = datetime.now()
-            stage = state["stage"]
             intent = detect_intent(message)
 
             # Handle restart/cancel at any stage
@@ -246,6 +262,10 @@ class ChatbotAPIView(APIView):
             if intent == "working_hours":
                 return Response({"bot": INTENTS["working_hours"]["response"]})
 
+            # Handle available dates request
+            if intent == "available_dates":
+                return Response({"bot": INTENTS["available_dates"]["response"]})
+
             return self._handle_conversation_stage(state, intent, message)
 
         except Exception as e:
@@ -253,7 +273,6 @@ class ChatbotAPIView(APIView):
             return Response(
                 {"bot": "I'm experiencing some technical difficulties. Please try again.", "error": True},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                
             )
 
     def _handle_conversation_stage(self, state, intent, message):
@@ -275,12 +294,21 @@ class ChatbotAPIView(APIView):
 
     def _handle_greeting_stage(self, state, intent, message):
         """Handle greeting and initial service request"""
-        if intent in ["greeting", "service_request"]:
+        if intent in ["greeting", "service_request", "service_with_date"]:
             service_type = validate_service_type(message)
+            
             if service_type:
                 state["service_type"] = service_type
-                state["stage"] = "choose_service"
-                return Response({"bot": f"Great! You've chosen {service_type.title()}. Which date would you prefer for your appointment?"})
+                
+                # Check if date is also provided
+                requested_date = parse_user_date(message)
+                if requested_date:
+                    # Process both service and date together
+                    state["stage"] = "choose_service"
+                    return self._process_service_and_date(state, service_type, requested_date)
+                else:
+                    state["stage"] = "choose_service"
+                    return Response({"bot": f"Great! You've chosen {service_type.title()}. Which date would you prefer for your appointment?"})
             else:
                 state["stage"] = "choose_service"
                 return Response({"bot": INTENTS["greeting"]["response"]})
@@ -300,8 +328,12 @@ class ChatbotAPIView(APIView):
         # Parse date from message
         requested_date = parse_user_date(message)
         if not requested_date:
-            requested_date = datetime.today().date()
+            return Response({"bot": "Please specify a date. You can say 'today', 'tomorrow', or any specific date you prefer."})
 
+        return self._process_service_and_date(state, state["service_type"], requested_date)
+
+    def _process_service_and_date(self, state, service_type, requested_date):
+        """Process service and date combination"""
         # Validate business day
         if not is_business_day(requested_date):
             return Response({"bot": "We're closed on Sundays. Please choose Monday through Saturday."})
@@ -310,11 +342,11 @@ class ChatbotAPIView(APIView):
 
         # Get available slots
         try:
-            available_slots = self._get_available_slots(state["service_type"], requested_date)
+            available_slots = self._get_available_slots(service_type, requested_date)
             
             if not available_slots:
                 return Response({
-                    "bot": f"Sorry, no slots available for {state['service_type']} on {requested_date.strftime('%B %d, %Y')}. Please try another date."
+                    "bot": f"Sorry, no slots available for {service_type} on {requested_date.strftime('%B %d, %Y')}. Please try another date."
                 })
 
             state["available_slots"] = available_slots
@@ -322,7 +354,7 @@ class ChatbotAPIView(APIView):
 
             # Create slot map and response
             slot_map = {}
-            slot_message = f"Available slots for {state['service_type'].title()} on {requested_date.strftime('%B %d, %Y')}:\n\n"
+            slot_message = f"Available slots for {service_type.title()} on {requested_date.strftime('%B %d, %Y')}:\n\n"
             counter = 1
             
             for staff_name, times in available_slots.items():
@@ -344,8 +376,7 @@ class ChatbotAPIView(APIView):
         # Check if user wants to change date
         new_date = parse_user_date(message)
         if new_date and new_date != state["requested_date"]:
-            state["requested_date"] = new_date
-            return self._handle_service_selection(state, intent, f"{state['service_type']} {message}")
+            return self._process_service_and_date(state, state["service_type"], new_date)
 
         slot_map = state.get("slot_map", {})
         if not slot_map:
@@ -391,9 +422,8 @@ class ChatbotAPIView(APIView):
         )
 
         return Response({
-            "bot": f"Perfect! Your {state['service_type']} appointment is reserved with {staff_name} at {slot_time} on {state['requested_date'].strftime('%B %d, %Y')}.\n\nClick here to complete your booking: {booking_url} \nThank you for choosing FIDDEN!"
+            "bot": f"Perfect! Your {state['service_type']} appointment is reserved with {staff_name} at {slot_time} on {state['requested_date'].strftime('%B %d, %Y')}.\n\nClick here to complete your booking: {booking_url} \n\nThank you for choosing FIDDEN!"
         })
-
 
     def _handle_booking_confirmation(self, state, intent, message):
         """Handle post-booking conversation"""
@@ -402,7 +432,7 @@ class ChatbotAPIView(APIView):
             return Response({"bot": INTENTS["thanks"]["response"]})
         
         # Reset for new booking
-        if intent in ["service_request", "greeting"]:
+        if intent in ["service_request", "greeting", "service_with_date"]:
             state.update({
                 "stage": "greeting",
                 "service_type": None,
